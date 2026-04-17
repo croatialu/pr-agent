@@ -27,6 +27,17 @@ MODEL_RETRIES = 2
 DUMMY_LITELLM_API_KEY = "dummy_key"  # placeholder set when no OpenAI key is configured
 
 
+def _get_streaming_models_from_config() -> list[str]:
+    configured_models = get_settings().config.get("enable_streaming_models", [])
+    if not configured_models:
+        return []
+    if isinstance(configured_models, str):
+        return [model.strip() for model in configured_models.split(",") if model.strip()]
+    if isinstance(configured_models, list):
+        return [model.strip() for model in configured_models if isinstance(model, str) and model.strip()]
+    raise ValueError("config.enable_streaming_models must be a list of model names or a comma-separated string")
+
+
 class LiteLLMAIHandler(BaseAiHandler):
     """
     This class handles interactions with the OpenAI API for chat completions.
@@ -236,7 +247,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         self.claude_extended_thinking_models = CLAUDE_EXTENDED_THINKING_MODELS
 
         # Models that require streaming
-        self.streaming_required_models = STREAMING_REQUIRED_MODELS
+        self.streaming_required_models = list(dict.fromkeys(STREAMING_REQUIRED_MODELS + _get_streaming_models_from_config()))
 
     @staticmethod
     def _write_frozen_aws_creds_to_env(frozen) -> None:

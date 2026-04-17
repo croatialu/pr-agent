@@ -6,6 +6,7 @@
 # models
 model="gpt-5.5-2026-04-23"
 fallback_models=["gpt-5.4-mini"]
+enable_streaming_models=[] # optional additional models that should be called with stream=true
 #model_reasoning="gpt-5.4-mini" # dedicated reasoning model for self-reflection
 #model_weak="gpt-5.4-nano" # optional, a weaker model to use for some easier tasks
 # CLI
