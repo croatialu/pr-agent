@@ -126,6 +126,11 @@ class PRReviewer:
             if self.incremental.is_incremental and not self._can_run_incremental_review():
                 return None
 
+            if get_settings().get("gitlab.auto_resolve_pr_agent_discussions", False) and hasattr(
+                self.git_provider, "auto_resolve_pr_agent_discussions"
+            ):
+                self.git_provider.auto_resolve_pr_agent_discussions()
+
             # if isinstance(self.args, list) and self.args and self.args[0] == 'auto_approve':
             #     get_logger().info(f'Auto approve flow PR: {self.pr_url} ...')
             #     self.auto_approve_logic()

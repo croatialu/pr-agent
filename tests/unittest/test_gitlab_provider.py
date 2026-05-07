@@ -192,3 +192,110 @@ class TestGitLabProvider:
         assert first == second == [{"diff": "d"}]
         m_pbp.assert_called_once_with("grp/repo")
         proj.repository_compare.assert_called_once_with("old", "new")
+
+    def test_auto_resolve_pr_agent_discussions_resolves_applied_suggestion(self, gitlab_provider):
+        note = {
+            "body": "**Suggestion:** fix this\n```suggestion\nnew_code()\n```",
+            "author": {"id": 7},
+            "type": "DiffNote",
+            "resolvable": True,
+            "suggestions": [{"applied": True, "to_content": "new_code()"}],
+            "position": {"new_path": "app.py"},
+        }
+        discussion = MagicMock()
+        discussion.id = "abc"
+        discussion.resolved = False
+        discussion.attributes = {"notes": [note]}
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+        gitlab_provider.gl.user.id = 7
+
+        resolved_count = gitlab_provider.auto_resolve_pr_agent_discussions()
+
+        assert resolved_count == 1
+        assert discussion.resolved is True
+        discussion.save.assert_called_once()
+
+    def test_auto_resolve_pr_agent_discussions_skips_human_suggestion(self, gitlab_provider):
+        note = {
+            "body": "**Suggestion:** fix this\n```suggestion\nnew_code()\n```",
+            "author": {"id": 8},
+            "type": "DiffNote",
+            "resolvable": True,
+            "suggestions": [{"applied": True, "to_content": "new_code()"}],
+            "position": {"new_path": "app.py"},
+        }
+        discussion = MagicMock()
+        discussion.id = "abc"
+        discussion.resolved = False
+        discussion.attributes = {"notes": [note]}
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+        gitlab_provider.gl.user.id = 7
+
+        resolved_count = gitlab_provider.auto_resolve_pr_agent_discussions()
+
+        assert resolved_count == 0
+        discussion.save.assert_not_called()
+
+    def test_auto_resolve_pr_agent_discussions_skips_unfixed_suggestion(self, gitlab_provider):
+        note = {
+            "body": "**Suggestion:** fix this\n```suggestion\nnew_code()\n```",
+            "author": {"id": 7},
+            "type": "DiffNote",
+            "resolvable": True,
+            "suggestions": [{"applied": False, "to_content": "new_code()"}],
+            "position": {"new_path": "app.py"},
+        }
+        discussion = MagicMock()
+        discussion.id = "abc"
+        discussion.resolved = False
+        discussion.attributes = {"notes": [note]}
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+        gitlab_provider.gl.user.id = 7
+
+        resolved_count = gitlab_provider.auto_resolve_pr_agent_discussions()
+
+        assert resolved_count == 0
+        discussion.save.assert_not_called()
+
+    def test_auto_resolve_pr_agent_discussions_skips_resolved_suggestion(self, gitlab_provider):
+        note = {
+            "body": "**Suggestion:** fix this\n```suggestion\nnew_code()\n```",
+            "author": {"id": 7},
+            "type": "DiffNote",
+            "resolved": True,
+            "resolvable": True,
+            "suggestions": [{"applied": True, "to_content": "new_code()"}],
+            "position": {"new_path": "app.py"},
+        }
+        discussion = MagicMock()
+        discussion.id = "abc"
+        discussion.resolved = False
+        discussion.attributes = {"notes": [note]}
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+        gitlab_provider.gl.user.id = 7
+
+        resolved_count = gitlab_provider.auto_resolve_pr_agent_discussions()
+
+        assert resolved_count == 0
+        discussion.save.assert_not_called()
+
+    def test_auto_resolve_pr_agent_discussions_skips_when_current_user_unknown(self, gitlab_provider):
+        note = {
+            "body": "**Suggestion:** fix this\n```suggestion\nnew_code()\n```",
+            "author": {"id": 7},
+            "type": "DiffNote",
+            "resolvable": True,
+            "suggestions": [{"applied": True, "to_content": "new_code()"}],
+            "position": {"new_path": "app.py"},
+        }
+        discussion = MagicMock()
+        discussion.id = "abc"
+        discussion.resolved = False
+        discussion.attributes = {"notes": [note]}
+        gitlab_provider.mr.discussions.list.return_value = [discussion]
+        gitlab_provider.gl.user = None
+
+        resolved_count = gitlab_provider.auto_resolve_pr_agent_discussions()
+
+        assert resolved_count == 0
+        discussion.save.assert_not_called()

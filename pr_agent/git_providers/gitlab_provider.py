@@ -206,6 +206,129 @@ class GitLabProvider(GitProvider):
 
         return None
 
+    @staticmethod
+    def _get_obj_value(obj, key: str, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _get_current_user_id(self):
+        try:
+            user_id = self._get_obj_value(self.gl.user, "id")
+            if user_id is not None:
+                return user_id
+        except Exception:
+            pass
+
+        try:
+            return self._get_obj_value(self.gl.user.get(), "id")
+        except Exception:
+            return None
+
+    def _get_discussion_notes(self, discussion) -> list:
+        attributes = self._get_obj_value(discussion, "attributes", {}) or {}
+        notes = attributes.get("notes") if isinstance(attributes, dict) else None
+        if notes is not None:
+            return notes or []
+
+        notes = self._get_obj_value(discussion, "notes", [])
+        if callable(notes):
+            try:
+                return notes.list(get_all=True)
+            except TypeError:
+                return notes.list()
+            except Exception:
+                return []
+        return notes or []
+
+    def _is_resolved_discussion(self, discussion) -> bool:
+        if self._get_obj_value(discussion, "resolved", False):
+            return True
+
+        for note in self._get_discussion_notes(discussion):
+            if self._get_obj_value(note, "resolved", False):
+                return True
+        return False
+
+    def _note_author_id(self, note):
+        author = self._get_obj_value(note, "author", {}) or {}
+        return self._get_obj_value(author, "id")
+
+    def _is_pr_agent_suggestion_discussion(self, discussion, current_user_id=None) -> bool:
+        for note in self._get_discussion_notes(discussion):
+            body = self._get_obj_value(note, "body", "") or ""
+            if not (body.startswith("**Suggestion:**") and "```suggestion" in body):
+                continue
+            if current_user_id is not None and str(self._note_author_id(note)) != str(current_user_id):
+                continue
+            if self._get_obj_value(note, "type") not in (None, "DiffNote"):
+                continue
+            if self._get_obj_value(note, "resolvable", True) is False:
+                continue
+            if self._get_obj_value(note, "resolved", False):
+                continue
+            if self._get_obj_value(note, "suggestions", []):
+                return True
+        return False
+
+    def _discussion_suggestion_applied(self, discussion) -> bool:
+        for note in self._get_discussion_notes(discussion):
+            for suggestion in self._get_obj_value(note, "suggestions", []) or []:
+                if self._get_obj_value(suggestion, "applied", False):
+                    return True
+        return False
+
+    def _resolve_discussion(self, discussion) -> bool:
+        discussion_id = self._get_obj_value(discussion, "id")
+        if not discussion_id:
+            return False
+
+        try:
+            discussion.resolved = True
+            discussion.save()
+            return True
+        except Exception:
+            try:
+                project = self.gl.projects.get(self.id_project)
+                discussion_obj = project.mergerequests.get(self.id_mr).discussions.get(discussion_id)
+                discussion_obj.resolved = True
+                discussion_obj.save()
+                return True
+            except Exception as e:
+                get_logger().warning(f"Failed to resolve GitLab discussion {discussion_id}: {e}")
+                return False
+
+    def auto_resolve_pr_agent_discussions(self) -> int:
+        try:
+            discussions = self.mr.discussions.list(get_all=True)
+        except Exception as e:
+            get_logger().warning(f"Failed to list GitLab discussions for merge request {self.id_mr}: {e}")
+            return 0
+
+        current_user_id = self._get_current_user_id()
+        if current_user_id is None:
+            get_logger().warning("Skipping GitLab discussion auto-resolve: failed to identify current GitLab user")
+            return 0
+
+        resolved_count = 0
+        for discussion in discussions:
+            try:
+                if self._is_resolved_discussion(discussion):
+                    continue
+                if not self._is_pr_agent_suggestion_discussion(discussion, current_user_id):
+                    continue
+                if not self._discussion_suggestion_applied(discussion):
+                    continue
+                if self._resolve_discussion(discussion):
+                    resolved_count += 1
+            except Exception as e:
+                discussion_id = self._get_obj_value(discussion, "id", "unknown")
+                get_logger().warning(f"Failed to inspect GitLab discussion {discussion_id}: {e}")
+
+        if resolved_count:
+            get_logger().info(f"Auto-resolved {resolved_count} PR-Agent GitLab discussions")
+        return resolved_count
+
     def _compare_submodule(self, proj_path: str, old_sha: str, new_sha: str) -> list[dict]:
         """
         Call repository_compare on submodule project; return list of diffs.
