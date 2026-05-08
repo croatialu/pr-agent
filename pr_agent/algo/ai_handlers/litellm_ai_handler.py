@@ -78,6 +78,10 @@ def _to_openai_responses_model(model: str) -> str:
     raise ValueError(f"Responses API is only supported for OpenAI models, got '{model}'")
 
 
+def _get_openai_responses_api_key() -> str | None:
+    return getattr(litellm, "openai_key", None) or os.environ.get("OPENAI_API_KEY")
+
+
 async def _handle_responses_stream(response):
     full_response = ""
     finish_reason = None
@@ -91,6 +95,9 @@ async def _handle_responses_stream(response):
         elif event_type == "response.failed":
             error = getattr(event, "error", None)
             raise openai.APIError(f"Responses API stream failed: {error}")
+        elif event_type == "response.incomplete":
+            incomplete_details = getattr(getattr(event, "response", None), "incomplete_details", None)
+            raise openai.APIError(f"Responses API stream incomplete: {incomplete_details}")
 
     if not full_response:
         raise openai.APIError("Responses API streaming response received no output text")
@@ -704,23 +711,21 @@ class LiteLLMAIHandler(BaseAiHandler):
         responses_kwargs = {
             "model": _to_openai_responses_model(model),
             "instructions": system,
-            "input": user,
+            "input": [{"role": "user", "content": user}],
             "stream": use_streaming,
         }
         if kwargs.get("timeout"):
             responses_kwargs["timeout"] = kwargs["timeout"]
         if kwargs.get("reasoning_effort"):
             responses_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
+        if kwargs.get("extra_headers"):
+            responses_kwargs["extra_headers"] = kwargs["extra_headers"]
 
         get_logger().info(f"Responses API completion request for model {model}; stream={use_streaming}")
         client_kwargs = {}
         if self.api_base:
             client_kwargs["base_url"] = self.api_base
-        responses_api_key = (
-            kwargs.get("api_key")
-            or getattr(litellm, "openai_key", None)
-            or getattr(litellm, "api_key", None)
-        )
+        responses_api_key = _get_openai_responses_api_key()
         if responses_api_key and responses_api_key != DUMMY_LITELLM_API_KEY:
             client_kwargs["api_key"] = responses_api_key
         client = AsyncOpenAI(**client_kwargs)

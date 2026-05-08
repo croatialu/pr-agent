@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
+import openai
 import pytest
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
@@ -92,7 +94,7 @@ class TestResponsesApiModels:
         call_kwargs = mock_client.responses.create.call_args[1]
         assert call_kwargs["model"] == "gpt-5.5"
         assert call_kwargs["instructions"] == "sys"
-        assert call_kwargs["input"] == "usr"
+        assert call_kwargs["input"] == [{"role": "user", "content": "usr"}]
         assert call_kwargs["stream"] is True
         assert call_kwargs["reasoning"] == {"effort": "medium"}
         assert "temperature" not in call_kwargs
@@ -181,6 +183,71 @@ class TestResponsesApiModels:
         assert mock_client_cls.call_args[1]["api_key"] == "test-openai-key"
 
     @pytest.mark.asyncio
+    async def test_responses_api_client_does_not_use_generic_litellm_api_key(self, monkeypatch):
+        monkeypatch.setattr(litellm, "openai_key", None)
+        monkeypatch.setattr(litellm, "api_key", "test-generic-provider-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            litellm_handler,
+            "get_settings",
+            lambda: _make_settings(use_responses_api_models=["openai/gpt-5.5"]),
+        )
+
+        with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.AsyncOpenAI") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.responses.create = AsyncMock(return_value=SimpleNamespace(output_text="ok", status="completed"))
+            mock_client_cls.return_value = mock_client
+
+            handler = LiteLLMAIHandler()
+            await handler.chat_completion(
+                model="openai/gpt-5.5",
+                system="sys",
+                user="usr",
+            )
+
+        assert "api_key" not in mock_client_cls.call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_responses_api_forwards_extra_headers(self, monkeypatch):
+        monkeypatch.setattr(
+            litellm_handler,
+            "get_settings",
+            lambda: _make_settings(use_responses_api_models=["openai/gpt-5.5"]),
+        )
+
+        with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.AsyncOpenAI") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.responses.create = AsyncMock(return_value=SimpleNamespace(output_text="ok", status="completed"))
+            mock_client_cls.return_value = mock_client
+
+            handler = LiteLLMAIHandler()
+            await handler._get_completion(
+                model="openai/gpt-5.5",
+                messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "usr"}],
+                timeout=30,
+                extra_headers={"x-test": "1"},
+            )
+
+        call_kwargs = mock_client.responses.create.call_args[1]
+        assert call_kwargs["extra_headers"] == {"x-test": "1"}
+
+    @pytest.mark.asyncio
+    async def test_responses_api_rejects_non_openai_provider_prefix(self, monkeypatch):
+        monkeypatch.setattr(
+            litellm_handler,
+            "get_settings",
+            lambda: _make_settings(use_responses_api_models=["azure/gpt-5.5"]),
+        )
+
+        handler = LiteLLMAIHandler()
+        with pytest.raises(ValueError, match="Responses API is only supported for OpenAI models"):
+            await handler._get_completion(
+                model="azure/gpt-5.5",
+                messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "usr"}],
+                timeout=30,
+            )
+
+    @pytest.mark.asyncio
     async def test_responses_api_model_can_run_without_streaming(self, monkeypatch):
         monkeypatch.setattr(
             litellm_handler,
@@ -205,3 +272,34 @@ class TestResponsesApiModels:
         call_kwargs = mock_client.responses.create.call_args[1]
         assert call_kwargs["model"] == "gpt-5.5"
         assert call_kwargs["stream"] is False
+
+    @pytest.mark.asyncio
+    async def test_responses_stream_incomplete_raises_api_error(self, monkeypatch):
+        monkeypatch.setattr(
+            litellm_handler,
+            "get_settings",
+            lambda: _make_settings(
+                use_responses_api_models=["openai/gpt-5.5"],
+                enable_streaming_models=["openai/gpt-5.5"],
+            ),
+        )
+        stream = _AsyncStream([
+            SimpleNamespace(type="response.output_text.delta", delta="partial"),
+            SimpleNamespace(
+                type="response.incomplete",
+                response=SimpleNamespace(incomplete_details={"reason": "max_output_tokens"}),
+            ),
+        ])
+
+        with patch("pr_agent.algo.ai_handlers.litellm_ai_handler.AsyncOpenAI") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.responses.create = AsyncMock(return_value=stream)
+            mock_client_cls.return_value = mock_client
+
+            handler = LiteLLMAIHandler()
+            with pytest.raises(openai.APIError, match="Responses API stream incomplete"):
+                await handler.chat_completion(
+                    model="openai/gpt-5.5",
+                    system="sys",
+                    user="usr",
+                )
