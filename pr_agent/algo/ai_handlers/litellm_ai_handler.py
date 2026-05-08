@@ -247,7 +247,15 @@ class LiteLLMAIHandler(BaseAiHandler):
         self.claude_extended_thinking_models = CLAUDE_EXTENDED_THINKING_MODELS
 
         # Models that require streaming
-        self.streaming_required_models = list(dict.fromkeys(STREAMING_REQUIRED_MODELS + _get_streaming_models_from_config()))
+        configured_streaming_models = _get_streaming_models_from_config()
+        self.streaming_required_models = list(dict.fromkeys(
+            STREAMING_REQUIRED_MODELS + configured_streaming_models
+        ))
+        if get_settings().config.verbosity_level >= 2:
+            get_logger().info(
+                f"Configured streaming models: {configured_streaming_models}; "
+                f"effective streaming models: {self.streaming_required_models}"
+            )
 
     @staticmethod
     def _write_frozen_aws_creds_to_env(frozen) -> None:
@@ -596,7 +604,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         Wrapper that automatically handles streaming for required models.
         """
         model = kwargs["model"]
-        if model in self.streaming_required_models:
+        use_streaming = model in self.streaming_required_models
+        get_logger().info(f"LiteLLM completion request for model {model}; stream={use_streaming}")
+        if use_streaming:
             kwargs["stream"] = True
             get_logger().info(f"Using streaming mode for model {model}")
             response = await acompletion(**kwargs)

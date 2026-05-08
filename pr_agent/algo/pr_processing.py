@@ -320,10 +320,11 @@ def generate_full_patch(convert_hunks_to_line_numbers, file_dict, max_tokens_mod
 async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelType.REGULAR):
     all_models = _get_all_models(model_type)
     all_deployments = _get_all_deployments(all_models)
+    get_logger().info(f"Attempting prediction with models: {all_models}")
     # try each (model, deployment_id) pair until one is successful, otherwise raise exception
     for i, (model, deployment_id) in enumerate(zip(all_models, all_deployments)):
         try:
-            get_logger().debug(
+            get_logger().info(
                 f"Generating prediction with {model}"
                 f"{(' from deployment ' + deployment_id) if deployment_id else ''}"
             )
