@@ -7,6 +7,7 @@ import litellm
 import openai
 import requests
 from litellm import acompletion
+from openai import AsyncOpenAI
 from tenacity import (retry, retry_if_exception_type,
                       retry_if_not_exception_type, stop_after_attempt)
 
@@ -36,6 +37,64 @@ def _get_streaming_models_from_config() -> list[str]:
     if isinstance(configured_models, list):
         return [model.strip() for model in configured_models if isinstance(model, str) and model.strip()]
     raise ValueError("config.enable_streaming_models must be a list of model names or a comma-separated string")
+
+
+def _get_responses_api_models_from_config() -> list[str]:
+    configured_models = get_settings().config.get("use_responses_api_models", [])
+    if not configured_models:
+        return []
+    if isinstance(configured_models, str):
+        return [model.strip() for model in configured_models.split(",") if model.strip()]
+    if isinstance(configured_models, list):
+        return [model.strip() for model in configured_models if isinstance(model, str) and model.strip()]
+    raise ValueError("config.use_responses_api_models must be a list of model names or a comma-separated string")
+
+
+def _strip_provider_prefix(model: str) -> str:
+    return model.split("/", 1)[-1]
+
+
+def _is_gpt5_model(model: str) -> bool:
+    return _strip_provider_prefix(model).startswith("gpt-5")
+
+
+def _model_matches_configured_models(model: str, configured_models: list[str]) -> bool:
+    model_without_provider = _strip_provider_prefix(model)
+    for configured_model in configured_models:
+        if "/" in configured_model:
+            if model == configured_model:
+                return True
+        elif model_without_provider == configured_model:
+            return True
+    return False
+
+
+def _to_openai_responses_model(model: str) -> str:
+    if "/" not in model:
+        return model
+    provider, model_name = model.split("/", 1)
+    if provider == "openai":
+        return model_name
+    raise ValueError(f"Responses API is only supported for OpenAI models, got '{model}'")
+
+
+async def _handle_responses_stream(response):
+    full_response = ""
+    finish_reason = None
+
+    async for event in response:
+        event_type = getattr(event, "type", None)
+        if event_type == "response.output_text.delta":
+            full_response += getattr(event, "delta", "") or ""
+        elif event_type == "response.completed":
+            finish_reason = "stop"
+        elif event_type == "response.failed":
+            error = getattr(event, "error", None)
+            raise openai.APIError(f"Responses API stream failed: {error}")
+
+    if not full_response:
+        raise openai.APIError("Responses API streaming response received no output text")
+    return full_response, finish_reason or "stop"
 
 
 class LiteLLMAIHandler(BaseAiHandler):
@@ -256,6 +315,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                 f"Configured streaming models: {configured_streaming_models}; "
                 f"effective streaming models: {self.streaming_required_models}"
             )
+        self.responses_api_models = _get_responses_api_models_from_config()
+        if get_settings().config.verbosity_level >= 2:
+            get_logger().info(f"Configured Responses API models: {self.responses_api_models}")
 
     @staticmethod
     def _write_frozen_aws_creds_to_env(frozen) -> None:
@@ -448,7 +510,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                                               {"type": "image_url", "image_url": {"url": img_path}}]
 
                 thinking_kwargs_gpt5 = None
-                if model.startswith('gpt-5'):
+                if _is_gpt5_model(model):
                     # Use configured reasoning_effort or default to MEDIUM
                     config_effort = get_settings().config.reasoning_effort
                     try:
@@ -467,7 +529,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                         "allowed_openai_params": ["reasoning_effort"],
                     }
                     get_logger().info(f"Using reasoning_effort='{effort}' for GPT-5 model")
-                    model = 'openai/'+model.replace('_thinking', '')  # remove _thinking suffix
+                    model = model.replace('_thinking', '')  # remove _thinking suffix
+                    if "/" not in model:
+                        model = 'openai/' + model
 
 
                 # Currently, some models do not support a separate system and user prompts
@@ -604,7 +668,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         Wrapper that automatically handles streaming for required models.
         """
         model = kwargs["model"]
-        use_streaming = model in self.streaming_required_models
+        use_streaming = _model_matches_configured_models(model, self.streaming_required_models)
+        if _model_matches_configured_models(model, self.responses_api_models):
+            return await self._get_responses_completion(use_streaming=use_streaming, **kwargs)
         get_logger().info(f"LiteLLM completion request for model {model}; stream={use_streaming}")
         if use_streaming:
             kwargs["stream"] = True
@@ -621,3 +687,54 @@ class LiteLLMAIHandler(BaseAiHandler):
             return (response["choices"][0]['message']['content'],
                     response["choices"][0]["finish_reason"],
                     response)
+
+    async def _get_responses_completion(self, use_streaming: bool, **kwargs):
+        model = kwargs["model"]
+        messages = kwargs["messages"]
+        system = ""
+        user = ""
+        for message in messages:
+            if message["role"] == "system":
+                system = message["content"]
+            elif message["role"] == "user":
+                user = message["content"]
+        if not isinstance(user, str):
+            raise ValueError("Responses API path currently supports text-only inputs")
+
+        responses_kwargs = {
+            "model": _to_openai_responses_model(model),
+            "instructions": system,
+            "input": user,
+            "stream": use_streaming,
+        }
+        if kwargs.get("timeout"):
+            responses_kwargs["timeout"] = kwargs["timeout"]
+        if kwargs.get("reasoning_effort"):
+            responses_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
+
+        get_logger().info(f"Responses API completion request for model {model}; stream={use_streaming}")
+        client_kwargs = {}
+        if self.api_base:
+            client_kwargs["base_url"] = self.api_base
+        responses_api_key = (
+            kwargs.get("api_key")
+            or getattr(litellm, "openai_key", None)
+            or getattr(litellm, "api_key", None)
+        )
+        if responses_api_key and responses_api_key != DUMMY_LITELLM_API_KEY:
+            client_kwargs["api_key"] = responses_api_key
+        client = AsyncOpenAI(**client_kwargs)
+        if not hasattr(client, "responses"):
+            raise ValueError("OpenAI SDK version does not support the Responses API. Upgrade the openai package.")
+        if use_streaming:
+            response = await client.responses.create(**responses_kwargs)
+            resp, finish_reason = await _handle_responses_stream(response)
+            return resp, finish_reason, MockResponse(resp, finish_reason)
+
+        response = await client.responses.create(**responses_kwargs)
+        resp = getattr(response, "output_text", "")
+        if not resp:
+            raise openai.APIError("Responses API response received no output text")
+        response_status = getattr(response, "status", None)
+        finish_reason = "stop" if response_status == "completed" else response_status or "stop"
+        return resp, finish_reason, MockResponse(resp, finish_reason)
