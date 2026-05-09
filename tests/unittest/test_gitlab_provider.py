@@ -5,6 +5,7 @@ from gitlab import Gitlab
 from gitlab.exceptions import GitlabGetError
 from gitlab.v4.objects import Project, ProjectFile
 
+from pr_agent.algo.types import FilePatchInfo
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 
 
@@ -192,3 +193,140 @@ class TestGitLabProvider:
         assert first == second == [{"diff": "d"}]
         m_pbp.assert_called_once_with("grp/repo")
         proj.repository_compare.assert_called_once_with("old", "new")
+
+    def test_send_inline_comment_logs_context_when_discussion_create_fails(self, gitlab_provider):
+        gitlab_provider.id_mr = 1
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.discussions.create.side_effect = Exception("invalid position")
+
+        diff = MagicMock(
+            base_commit_sha="base-sha",
+            start_commit_sha="start-sha",
+            head_commit_sha="head-sha",
+        )
+        target_file = FilePatchInfo(
+            base_file="old line",
+            head_file="new line",
+            patch="@@ -1,1 +1,1 @@\n-old line\n+new line",
+            filename="src/app.py",
+        )
+        original_suggestion = {
+            "relevant_lines_start": 1,
+            "relevant_lines_end": 1,
+            "existing_code": "old line",
+            "improved_code": "new line",
+            "suggestion_content": "Use the new line",
+            "label": "bug fix",
+            "score": 8,
+        }
+
+        with patch.object(gitlab_provider, "get_relevant_diff", return_value=diff), \
+             patch.object(gitlab_provider, "get_line_link", return_value="https://gitlab.example/src/app.py#L1"), \
+             patch("pr_agent.git_providers.gitlab_provider.get_logger") as mock_get_logger:
+            logger = mock_get_logger.return_value
+
+            gitlab_provider.send_inline_comment(
+                body="**Suggestion:** Use the new line\n```suggestion:-0+0\nnew line\n```",
+                edit_type="addition",
+                found=True,
+                relevant_file="src/app.py",
+                relevant_line_in_file="new line",
+                source_line_no=-1,
+                target_file=target_file,
+                target_line_no=2,
+                original_suggestion=original_suggestion,
+            )
+
+        logger.warning.assert_called_once()
+        log_message = logger.warning.call_args.args[0]
+        log_artifact = logger.warning.call_args.kwargs["artifact"]
+
+        assert "Failed to create GitLab inline discussion" in log_message
+        assert log_artifact["error"] == "invalid position"
+        assert log_artifact["position"]["new_line"] == 1
+        assert log_artifact["relevant_file"] == "src/app.py"
+        assert log_artifact["relevant_lines_start"] == 1
+        assert log_artifact["relevant_lines_end"] == 1
+
+    def test_publish_code_suggestions_skips_gitlab_discussion_for_non_diff_line(self, gitlab_provider):
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.diff_refs = {
+            "base_sha": "base-ref",
+            "start_sha": "start-ref",
+            "head_sha": "head-ref",
+        }
+        gitlab_provider.diff_files = [
+            FilePatchInfo(
+                base_file="line 1\nline 2\nline 3",
+                head_file="line 1\nline 2\nline 3",
+                patch="@@ -1,3 +1,3 @@\n line 1\n-line old\n+line new\n line 3",
+                filename="src/app.py",
+            )
+        ]
+        suggestion = {
+            "body": "**Suggestion:** Change line 3\n```suggestion\nline 3 changed\n```",
+            "relevant_file": "src/app.py",
+            "relevant_lines_start": 3,
+            "relevant_lines_end": 3,
+            "original_suggestion": {
+                "relevant_lines_start": 3,
+                "relevant_lines_end": 3,
+                "existing_code": "line 3",
+                "improved_code": "line 3 changed",
+                "suggestion_content": "Change line 3",
+                "label": "possible issue",
+                "score": 7,
+            },
+        }
+
+        with patch.object(gitlab_provider, "get_diff_files", return_value=gitlab_provider.diff_files), \
+             patch.object(gitlab_provider, "get_line_link", return_value="https://gitlab.example/src/app.py#L3"), \
+             patch("pr_agent.git_providers.gitlab_provider.get_logger"):
+            gitlab_provider.publish_code_suggestions([suggestion])
+
+        gitlab_provider.mr.discussions.create.assert_not_called()
+        gitlab_provider.mr.notes.create.assert_called_once()
+
+    def test_publish_code_suggestions_uses_mr_diff_refs_for_valid_diff_line(self, gitlab_provider):
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.diff_refs = {
+            "base_sha": "base-ref",
+            "start_sha": "start-ref",
+            "head_sha": "head-ref",
+        }
+        gitlab_provider.diff_files = [
+            FilePatchInfo(
+                base_file="line old",
+                head_file="line new",
+                patch="@@ -1,1 +1,1 @@\n-line old\n+line new",
+                filename="src/app.py",
+            )
+        ]
+        suggestion = {
+            "body": "**Suggestion:** Use better text\n```suggestion\nline better\n```",
+            "relevant_file": "src/app.py",
+            "relevant_lines_start": 1,
+            "relevant_lines_end": 1,
+            "original_suggestion": {
+                "relevant_lines_start": 1,
+                "relevant_lines_end": 1,
+                "existing_code": "line new",
+                "improved_code": "line better",
+                "suggestion_content": "Use better text",
+                "label": "possible issue",
+                "score": 7,
+            },
+        }
+
+        with patch.object(gitlab_provider, "get_diff_files", return_value=gitlab_provider.diff_files), \
+             patch("pr_agent.git_providers.gitlab_provider.get_logger"):
+            gitlab_provider.publish_code_suggestions([suggestion])
+
+        gitlab_provider.mr.discussions.create.assert_called_once()
+        position = gitlab_provider.mr.discussions.create.call_args.args[0]["position"]
+
+        assert position["base_sha"] == "base-ref"
+        assert position["start_sha"] == "start-ref"
+        assert position["head_sha"] == "head-ref"
+        assert position["new_line"] == 1
+        gitlab_provider.mr.notes.create.assert_not_called()

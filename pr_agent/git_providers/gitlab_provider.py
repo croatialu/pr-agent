@@ -567,7 +567,7 @@ class GitLabProvider(GitProvider):
             pos_obj = {'position_type': 'text',
                        'new_path': target_file.filename,
                        'old_path': target_file.old_filename if target_file.old_filename else target_file.filename,
-                       'base_sha': diff.base_commit_sha, 'start_sha': diff.start_commit_sha, 'head_sha': diff.head_commit_sha}
+                       **self._get_position_diff_refs(diff)}
             if edit_type == 'deletion':
                 pos_obj['old_line'] = source_line_no - 1
             elif edit_type == 'addition':
@@ -579,61 +579,31 @@ class GitLabProvider(GitProvider):
             try:
                 self.mr.discussions.create({'body': body, 'position': pos_obj})
             except Exception as e:
-                try:
-                    # fallback - create a general note on the file in the MR
+                log_artifact = {
+                    "error": str(e),
+                    "position": pos_obj,
+                    "relevant_file": relevant_file,
+                    "relevant_line_in_file": relevant_line_in_file,
+                    "source_line_no": source_line_no,
+                    "target_line_no": target_line_no,
+                    "edit_type": edit_type,
+                    "fallback": "mr_note",
+                }
+                if original_suggestion:
                     if 'suggestion_orig_location' in original_suggestion:
-                        line_start = original_suggestion['suggestion_orig_location']['start_line']
-                        line_end = original_suggestion['suggestion_orig_location']['end_line']
-                        old_code_snippet = original_suggestion['prev_code_snippet']
-                        new_code_snippet = original_suggestion['new_code_snippet']
-                        content = original_suggestion['suggestion_summary']
-                        label = original_suggestion['category']
-                        if 'score' in original_suggestion:
-                            score = original_suggestion['score']
-                        else:
-                            score = 7
+                        suggestion_location = original_suggestion['suggestion_orig_location']
+                        log_artifact["relevant_lines_start"] = suggestion_location.get('start_line')
+                        log_artifact["relevant_lines_end"] = suggestion_location.get('end_line')
                     else:
-                        line_start = original_suggestion['relevant_lines_start']
-                        line_end = original_suggestion['relevant_lines_end']
-                        old_code_snippet = original_suggestion['existing_code']
-                        new_code_snippet = original_suggestion['improved_code']
-                        content = original_suggestion['suggestion_content']
-                        label = original_suggestion['label']
-                        score = original_suggestion.get('score', 7)
-
-                    if hasattr(self, 'main_language'):
-                        language = self.main_language
-                    else:
-                        language = ''
-                    link = self.get_line_link(relevant_file, line_start, line_end)
-                    body_fallback =f"**Suggestion:** {content} [{label}, importance: {score}]\n\n"
-                    body_fallback +=f"\n\n<details><summary>[{target_file.filename} [{line_start}-{line_end}]]({link}):</summary>\n\n"
-                    body_fallback += f"\n\n___\n\n`(Cannot implement directly - GitLab API allows committable suggestions strictly on MR diff lines)`"
-                    body_fallback+="</details>\n\n"
-                    diff_patch = difflib.unified_diff(old_code_snippet.split('\n'),
-                                                new_code_snippet.split('\n'), n=999)
-                    patch_orig = "\n".join(diff_patch)
-                    patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
-                    diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
-                    body_fallback += diff_code
-
-                    # Create a general note on the file in the MR
-                    self.mr.notes.create({
-                        'body': body_fallback,
-                        'position': {
-                            'base_sha': diff.base_commit_sha,
-                            'start_sha': diff.start_commit_sha,
-                            'head_sha': diff.head_commit_sha,
-                            'position_type': 'text',
-                            'file_path': f'{target_file.filename}',
-                        }
-                    })
-                    get_logger().debug(f"Created fallback comment in MR {self.id_mr} with position {pos_obj}")
-
-                    # get_logger().debug(
-                    #     f"Failed to create comment in MR {self.id_mr} with position {pos_obj} (probably not a '+' line)")
-                except Exception as e:
-                    get_logger().exception(f"Failed to create comment in MR {self.id_mr}")
+                        log_artifact["relevant_lines_start"] = original_suggestion.get('relevant_lines_start')
+                        log_artifact["relevant_lines_end"] = original_suggestion.get('relevant_lines_end')
+                get_logger().warning("Failed to create GitLab inline discussion; falling back to MR note",
+                                     artifact=log_artifact)
+                self._fallback_code_suggestion_to_note(
+                    {"relevant_file": relevant_file, "original_suggestion": original_suggestion},
+                    target_file,
+                    "GitLab API allows committable suggestions strictly on MR diff lines",
+                )
 
     def get_relevant_diff(self, relevant_file: str, relevant_line_in_file: str) -> Optional[dict]:
         _changes = self.mr.changes()  # dict
@@ -654,6 +624,86 @@ class GitLabProvider(GitProvider):
                 f'No relevant diff found for {relevant_file} {relevant_line_in_file}. Falling back to last diff.')
         return self.last_diff  # fallback to last_diff if no relevant diff is found
 
+    def _get_position_diff_refs(self, diff) -> dict:
+        diff_refs = getattr(self.mr, "diff_refs", {}) or {}
+        if not isinstance(diff_refs, dict):
+            diff_refs = {}
+        base_sha = diff_refs.get("base_sha") or getattr(diff, "base_commit_sha", None)
+        start_sha = diff_refs.get("start_sha") or getattr(diff, "start_commit_sha", None)
+        head_sha = diff_refs.get("head_sha") or getattr(diff, "head_commit_sha", None)
+        return {"base_sha": base_sha, "start_sha": start_sha, "head_sha": head_sha}
+
+    def _find_new_line_in_patch(self, file: FilePatchInfo, absolute_line: int) -> tuple[bool, int, str]:
+        if absolute_line < 1 or not file.patch:
+            return False, -1, ""
+
+        target_line_no = 0
+        for line in file.patch.splitlines():
+            if line.startswith('@@'):
+                match = self.RE_HUNK_HEADER.match(line)
+                if not match:
+                    continue
+                _, _, start_new, _, _ = match.groups()
+                target_line_no = int(start_new)
+                continue
+            if line.startswith('-'):
+                continue
+            if target_line_no == absolute_line:
+                if line.startswith('+'):
+                    return True, target_line_no, line[1:]
+                return False, target_line_no, line[1:] if line.startswith(' ') else line
+            target_line_no += 1
+        return False, -1, ""
+
+    @staticmethod
+    def _get_original_suggestion_context(original_suggestion: dict) -> dict:
+        if 'suggestion_orig_location' in original_suggestion:
+            suggestion_location = original_suggestion['suggestion_orig_location']
+            return {
+                "line_start": suggestion_location['start_line'],
+                "line_end": suggestion_location['end_line'],
+                "old_code_snippet": original_suggestion['prev_code_snippet'],
+                "new_code_snippet": original_suggestion['new_code_snippet'],
+                "content": original_suggestion['suggestion_summary'],
+                "label": original_suggestion['category'],
+                "score": original_suggestion.get('score', 7),
+            }
+        return {
+            "line_start": original_suggestion['relevant_lines_start'],
+            "line_end": original_suggestion['relevant_lines_end'],
+            "old_code_snippet": original_suggestion['existing_code'],
+            "new_code_snippet": original_suggestion['improved_code'],
+            "content": original_suggestion['suggestion_content'],
+            "label": original_suggestion['label'],
+            "score": original_suggestion.get('score', 7),
+        }
+
+    def _build_code_suggestion_fallback_body(self, suggestion: dict, target_file: FilePatchInfo, reason: str) -> str:
+        original_suggestion = suggestion.get('original_suggestion', suggestion)
+        context = self._get_original_suggestion_context(original_suggestion)
+
+        link = self.get_line_link(suggestion['relevant_file'], context["line_start"], context["line_end"])
+        body = (
+            f"**Suggestion:** {context['content']} [{context['label']}, importance: {context['score']}]\n\n"
+            f"\n\n<details><summary>[{target_file.filename} "
+            f"[{context['line_start']}-{context['line_end']}]]({link}):</summary>\n\n"
+            f"\n\n___\n\n`(Cannot implement directly - {reason})`"
+            "</details>\n\n"
+        )
+        diff_patch = difflib.unified_diff(
+            context["old_code_snippet"].split('\n'),
+            context["new_code_snippet"].split('\n'),
+            n=999,
+        )
+        patch = "\n".join("\n".join(diff_patch).splitlines()[5:]).strip('\n')
+        return body + f"\n\n```diff\n{patch.rstrip()}\n```"
+
+    def _fallback_code_suggestion_to_note(self, suggestion: dict, target_file: FilePatchInfo, reason: str):
+        try:
+            self.mr.notes.create({'body': self._build_code_suggestion_fallback_body(suggestion, target_file, reason)})
+        except Exception:
+            get_logger().exception(f"Failed to create fallback note for code suggestion")
+
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
         for suggestion in code_suggestions:
             try:
@@ -673,21 +723,38 @@ class GitLabProvider(GitProvider):
                         if file.filename == relevant_file:
                             target_file = file
                             break
+                if target_file is None:
+                    get_logger().warning("Could not find target file for GitLab code suggestion",
+                                         artifact={"relevant_file": relevant_file})
+                    continue
                 range = relevant_lines_end - relevant_lines_start # no need to add 1
                 body = body.replace('```suggestion', f'```suggestion:-0+{range}')
-                lines = target_file.head_file.splitlines()
-                relevant_line_in_file = lines[relevant_lines_start - 1]
+                found, target_line_no, relevant_line_in_file = self._find_new_line_in_patch(target_file,
+                                                                                            relevant_lines_start)
+                if not found:
+                    get_logger().warning("Skipping GitLab inline discussion for non-diff code suggestion line",
+                                         artifact={
+                                             "relevant_file": relevant_file,
+                                             "relevant_lines_start": relevant_lines_start,
+                                             "relevant_lines_end": relevant_lines_end,
+                                             "target_line_no": target_line_no,
+                                             "fallback": "mr_note",
+                                         })
+                    self._fallback_code_suggestion_to_note(
+                        suggestion,
+                        target_file,
+                        "GitLab API allows committable suggestions strictly on MR diff lines",
+                    )
+                    continue
 
                 # edit_type, found, source_line_no, target_file, target_line_no = self.find_in_file(target_file,
                 #                                                                            relevant_line_in_file)
                 # for code suggestions, we want to edit the new code
                 source_line_no = -1
-                target_line_no = relevant_lines_start + 1
-                found = True
                 edit_type = 'addition'
 
                 self.send_inline_comment(body, edit_type, found, relevant_file, relevant_line_in_file, source_line_no,
-                                         target_file, target_line_no, original_suggestion)
+                                         target_file, target_line_no + 1, original_suggestion)
             except Exception as e:
                 get_logger().exception(f"Could not publish code suggestion:\nsuggestion: {suggestion}\nerror: {e}")
 
