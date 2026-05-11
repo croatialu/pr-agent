@@ -1,9 +1,8 @@
 import difflib
-import hashlib
 import re
 import urllib.parse
-from typing import Any, Optional, Tuple, Union
-from urllib.parse import parse_qs, urlparse
+from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import gitlab
 import requests
@@ -26,6 +25,7 @@ from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider
 class DiffNotFoundError(Exception):
     """Raised when the diff for a merge request cannot be found."""
     pass
+
 
 class GitLabProvider(GitProvider):
 
@@ -720,9 +720,8 @@ class GitLabProvider(GitProvider):
                 target_file = None
                 for file in diff_files:
                     if file.filename == relevant_file:
-                        if file.filename == relevant_file:
-                            target_file = file
-                            break
+                        target_file = file
+                        break
                 if target_file is None:
                     get_logger().warning("Could not find target file for GitLab code suggestion",
                                          artifact={"relevant_file": relevant_file})
